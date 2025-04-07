@@ -1,59 +1,79 @@
 import numpy as np
-from scipy.fft import fft, ifft
+from scipy.fft import ifft
 
 class SonarModem:
-    """OFDM-based Sonar Modem with DSP enhancements"""
+    """OFDM-based Sonar Modem with Pilot Insertion and Adaptive Modulation"""
+
     def __init__(self, carrier_freq=25e3, bandwidth=10e3, subcarriers=64, cyclic_prefix=16):
         self.carrier_freq = carrier_freq
         self.bandwidth = bandwidth
         self.subcarriers = subcarriers
         self.cyclic_prefix = cyclic_prefix
+        self.last_ofdm_symbol = None
 
-        # QPSK constellation
-        self.constellation = {
-            0: (1 + 1j) / np.sqrt(2),
-            1: (-1 + 1j) / np.sqrt(2),
-            2: (-1 - 1j) / np.sqrt(2),
-            3: (1 - 1j) / np.sqrt(2)
-        }
+    def qam_constellation(self, M):
+        if M == 2:  # BPSK
+            return np.array([1, -1])
+        elif M == 4:  # QPSK
+            return np.array([1+1j, -1+1j, 1-1j, -1-1j]) / np.sqrt(2)
+        elif M == 16:  # 16-QAM
+            real = np.array([-3, -1, 1, 3])
+            imag = np.array([-3, -1, 1, 3])
+            grid = [x + 1j*y for x in real for y in imag]
+            return np.array(grid) / np.sqrt(10)
+        else:
+            raise ValueError("Unsupported modulation order")
 
-    def transmit(self, data_bits, return_symbols=False):
-        """Convert bits to OFDM sonar signal"""
-        if len(data_bits) % 2 != 0:
-            raise ValueError("Number of bits must be even for QPSK modulation")
+    def bits_to_symbols(self, bits, M):
+        k = int(np.log2(M))
+        bits = bits[:len(bits) - len(bits) % k]
+        symbol_indices = bits.reshape((-1, k)).dot(1 << np.arange(k)[::-1])
+        return self.qam_constellation(M)[symbol_indices]
 
-        # QPSK modulation
-        symbols = np.array([self.constellation[int(f"{b1}{b2}", 2)]
-                            for b1, b2 in zip(data_bits[::2], data_bits[1::2])])
+    def symbols_to_bits(self, symbols, M):
+        const = self.qam_constellation(M)
+        dists = abs(symbols.reshape(-1, 1) - const)**2
+        indices = np.argmin(dists, axis=1)
+        k = int(np.log2(M))
+        bits = ((indices[:, None] & (1 << np.arange(k)[::-1])) > 0).astype(int)
+        return bits.flatten()
 
-        if return_symbols:
-            return symbols  # Return symbols for visualization
+    def insert_pilots(self, symbols, pilot_interval=4):
+        N = self.subcarriers
+        ofdm_symbol = np.zeros(N, dtype=complex)
+        pilots = np.ones(N // pilot_interval, dtype=complex)
+        data_idx = [i for i in range(N) if i % pilot_interval != 0]
+        pilot_idx = [i for i in range(N) if i % pilot_interval == 0]
 
-        # OFDM modulation
-        ofdm_symbols = ifft(symbols, self.subcarriers)
-        tx_signal = np.concatenate([ofdm_symbols[-self.cyclic_prefix:], ofdm_symbols])
-        return np.real(tx_signal)
+        if len(symbols) != len(data_idx):
+            raise ValueError(f"Expected {len(data_idx)} symbols, got {len(symbols)}")
 
-    def receive(self, rx_signal, return_symbols=False):
-        """Demodulate received sonar signal"""
-        # Remove cyclic prefix
-        cp_removed = rx_signal[self.cyclic_prefix:]
+        ofdm_symbol[pilot_idx] = pilots
+        ofdm_symbol[data_idx] = symbols
+        return ofdm_symbol, pilot_idx, data_idx, pilots
 
-        # OFDM demodulation
-        symbols = fft(cp_removed, self.subcarriers)
+    def transmit_with_pilots(self, bits, snr_dB=15, pilot_interval=4):
+        M = self.select_modulation(snr_dB)
+        k = int(np.log2(M))
+        num_data_subcarriers = self.subcarriers - self.subcarriers // pilot_interval
+        max_bits = num_data_subcarriers * k
+        bits = bits[:max_bits]  # Trim bits to fit symbol count
 
-        if return_symbols:
-            return symbols  # Return symbols for visualization
+        symbols = self.bits_to_symbols(bits, M)
+        ofdm_symbol, pilot_idx, data_idx, pilots = self.insert_pilots(symbols, pilot_interval)
+        self.last_ofdm_symbol = ofdm_symbol
+        tx_time = ifft(ofdm_symbol)
+        return tx_time, pilot_idx, data_idx, pilots
 
-        # QPSK demodulation
-        rx_bits = []
+    def demodulate(self, symbols, snr_dB=15):
+        M = self.select_modulation(snr_dB)
+        return self.symbols_to_bits(symbols, M)
 
-        for symbol in symbols:
-            # Find the closest constellation point
-            distances = [np.abs(symbol - point) for point in self.constellation.values()]
-            closest = np.argmin(distances)
-            # Convert to bits (2 bits per symbol)
-            rx_bits.extend([int(bit) for bit in f"{closest:02b}"])
-        return np.array(rx_bits)
-        rx_bits = modem.receive(cleaned_signal)
-        print(f"Number of received bits: {len(rx_bits)}")
+    def select_modulation(self, snr_dB):
+        if snr_dB > 20:
+            return 16
+        elif snr_dB > 10:
+            return 4
+        else:
+            return 2
+

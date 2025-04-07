@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.interpolate import interp1d
 
 class AdaptiveEqualizer:
     """LMS Adaptive Equalizer for multipath compensation"""
@@ -8,12 +9,17 @@ class AdaptiveEqualizer:
         self.error_history = []
 
     def update(self, received, reference):
-        """Update filter weights"""
         error = reference - np.dot(self.weights, received)
         self.weights += self.mu * error * np.conj(received)
-        self.error_history.append(np.abs(error) ** 2)
-        return np.abs(error) ** 2
+        self.error_history.append(abs(error))
 
     def equalize(self, signal):
-        """Apply learned weights to signal"""
-        return np.convolve(signal, self.weights[::-1], mode='same')
+        output = np.convolve(signal, self.weights[::-1], mode='same')
+        return output
+
+def ls_channel_estimation(rx_symbol, pilot_idx, pilots):
+    return rx_symbol[pilot_idx] / pilots
+
+def interpolate_channel(H_est, pilot_idx, N):
+    interp_func = interp1d(pilot_idx, H_est, kind='linear', fill_value="extrapolate")
+    return interp_func(np.arange(N))
